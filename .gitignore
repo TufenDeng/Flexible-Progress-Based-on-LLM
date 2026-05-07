@@ -1,0 +1,37 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境 (绝对不能上传，因为它是根据你电脑路径生成的)
+venv/
+ENV/
+env/
+
+# 编译后的二进制包
+*.whl
+
+# 临时抓取的图像或数据 (防止把你测试抓的照片传上去)
+*.jpg
+*.png
+*.npy
+capture_*/
+
+# IDE 配置文件
+.vscode/
+.idea/
+
+# 系统相关
+Thumbs.db
+desktop.ini
+
+# --- 关于 DLL 的处理 ---
+# 如果你想让仓库保持纯净，不建议上传 DLL。
+# 但对于机械臂项目，为了让别人下载即用，通常会保留 SDK 相关的 DLL。
+# 我们建议忽略掉微软的系统库，只保留奥比中光的驱动库。
+
+libs/msvcp140.dll
+libs/msvcp140_1.dll
+libs/msvcp140_2.dll
+libs/vcruntime140.dll
+libs/concrt140.dll
