@@ -35,3 +35,7 @@ libs/msvcp140_1.dll
 libs/msvcp140_2.dll
 libs/vcruntime140.dll
 libs/concrt140.dll
+
+# 排除奥比中光生成的日志文件夹
+Log/
+*.log.txt

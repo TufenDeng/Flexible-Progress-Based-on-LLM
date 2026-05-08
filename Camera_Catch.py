@@ -6,6 +6,8 @@ import sys
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 libs_path = os.path.join(current_dir, 'libs')
+if os.path.exists(libs_path):
+    os.add_dll_directory(libs_path) # 告诉程序去 libs 找驱动
 
 from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode, VideoStreamProfile
 
@@ -26,8 +28,8 @@ class Gemini335Camera:
             depth_profile = depth_profiles.get_default_video_stream_profile()
             self.config.enable_stream(depth_profile)
 
-            # 3. 开启硬件对齐 (Gemini 335 特色：深度图完美对齐彩色图)
-            self.config.set_align_mode(OBAlignMode.ALIGN_D2C_HW_MODE)
+            # 3. 开启软件对齐 (Gemini 335 特色：深度图完美对齐彩色图)
+            self.config.set_align_mode(OBAlignMode.SW_MODE)
 
             # 4. 启动相机
             self.pipeline.start(self.config)
@@ -36,10 +38,6 @@ class Gemini335Camera:
             print(f"初始化失败: {e}")
 
     def capture_image(self):
-        """
-        功能：抓取当前一帧图像
-        返回：color_image, depth_image
-        """
         frames = self.pipeline.wait_for_frames(100)
         if frames is None:
             return None, None
@@ -50,10 +48,27 @@ class Gemini335Camera:
         if color_frame is None or depth_frame is None:
             return None, None
 
-        # 转换为 numpy 格式
-        color_data = np.asanyarray(color_frame.get_data()).reshape((color_frame.get_height(), color_frame.get_width(), 3))
-        color_img = cv2.cvtColor(color_data, cv2.COLOR_RGB2BGR)
+        # 1. 处理彩色图
+        raw_data = color_frame.get_data()
+        fmt = color_frame.get_format()
 
+        #使用 MJPG
+        if fmt == OBFormat.MJPG:
+            # 解码压缩格式
+            color_img = cv2.imdecode(np.frombuffer(raw_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        elif fmt == OBFormat.RGB888:
+            # 原始 RGB 格式
+            color_img = np.asanyarray(raw_data).reshape((color_frame.get_height(), color_frame.get_width(), 3))
+            color_img = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
+        else:
+            # 兼容其他可能出现的 YUV 格式（尝试直接 reshape，如果报错再处理）
+            try:
+                color_img = np.asanyarray(raw_data).reshape((color_frame.get_height(), color_frame.get_width(), 3))
+            except:
+                print(f"无法处理的图像格式: {fmt}")
+                return None, None
+
+        # 2. 处理深度图
         depth_data = np.asanyarray(depth_frame.get_data()).view(np.uint16).reshape((depth_frame.get_height(), depth_frame.get_width()))
 
         return color_img, depth_data
@@ -72,10 +87,15 @@ class Gemini335Camera:
             depth_view = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             depth_view = cv2.applyColorMap(depth_view, cv2.COLORMAP_JET)
 
-            # 左右拼接显示
+            # 确保深度图和彩色图高度一致
+            if color.shape[0] != depth_view.shape[0]:
+                # 将 depth_view 缩放到和 color 一样的高度
+                # 同时也按比例缩放宽度，或者直接缩放到彩色图的大小
+                depth_view = cv2.resize(depth_view, (color.shape[1], color.shape[0]))
+
             combined = np.hstack((color, depth_view))
             cv2.imshow("Gemini 335 Preview (RGB | Depth)", combined)
-
+            
             key = cv2.waitKey(1)
             if key & 0xFF == ord('q'):
                 break
