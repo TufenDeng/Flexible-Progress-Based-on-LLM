@@ -3,6 +3,7 @@ import numpy as np
 import os
 import time
 import sys
+from pupil_apriltags import Detector
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 libs_path = os.path.join(current_dir, 'libs')
@@ -16,6 +17,9 @@ class Gemini335Camera:
     def __init__(self):
         self.pipeline = Pipeline()
         self.config = Config()
+
+        # 初始化 AprilTag 检测器
+        self.at_detector = Detector(families='tag36h11',nthreads=2)
 
         try:
             # 1. 配置彩色流
@@ -73,15 +77,64 @@ class Gemini335Camera:
 
         return color_img, depth_data
 
+    def detect_apriltags(self, color_img,depth_img,max_dist=2000):
+        #识别AprilTag并通过深度传感器过渡距离
+        gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+        # 仅识别 ID，不进行复杂的 3D 姿态推算
+        tags = self.at_detector.detect(gray, estimate_tag_pose=False)
+        
+        valid_tags = []
+        for tag in tags:
+            # 获取中心点像素坐标
+            ix, iy = int(tag.center[0]), int(tag.center[1])
+            
+            # 边界检查
+            if iy >= depth_img.shape[0] or ix >= depth_img.shape[1]: continue
+            
+            # 直接从深度传感器获取该点的距离 (mm)
+            dist = depth_img[iy, ix]
+            
+            # 限制在 2 米 (2000mm) 以内
+            if 0 < dist <= max_dist:
+                valid_tags.append({
+                    'id': tag.tag_id,
+                    'center': (ix, iy),
+                    'distance': dist,
+                    'corners': tag.corners.astype(int)
+                })
+        return valid_tags
+
     def show_realtime(self):
         """
         功能：实时图像预览
         操作：按 's' 键抓取单帧，按 'q' 键退出
         """
         print("进入预览模式。按 's' 抓取并保存图像，按 'q' 退出。")
+        print("多模式预览启动：")
+        print("- 窗口1: 原始RGB (带Tag识别)")
+        print("- 窗口2: RGB+深度图拼接")
+        print("- 窗口3: 深度融合图 (Fusion)")
+        print("按 'q' 退出。")
+
         while True:
             color, depth = self.capture_image()
             if color is None: continue
+
+            # 运行识别逻辑
+            tags = self.detect_apriltags(color, depth, max_dist=3500)
+
+            # 在彩色图上画出识别结果,拷贝出一个副本在副本上画图，保证原始color数据纯净
+            canvas_rgb = color.copy()
+            for tag in tags:
+                # 画框
+                cv2.polylines(canvas_rgb, [tag['corners']], True, (0, 255, 0), 2)
+                # 画中心点
+                cv2.circle(canvas_rgb, tag['center'], 5, (0, 0, 255), -1)
+                # 显示 ID 和 深度传感器测得的距离
+                info_text = f"ID:{tag['id']} Dist:{tag['distance']}mm"
+                cv2.putText(canvas_rgb, info_text, (tag['center'][0]-50, tag['center'][1]-20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
 
             # 为了预览，对深度图进行伪彩色处理
             depth_view = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
@@ -93,8 +146,26 @@ class Gemini335Camera:
                 # 同时也按比例缩放宽度，或者直接缩放到彩色图的大小
                 depth_view = cv2.resize(depth_view, (color.shape[1], color.shape[0]))
 
-            combined = np.hstack((color, depth_view))
-            cv2.imshow("Gemini 335 Preview (RGB | Depth)", combined)
+            #生成3种显示模式
+
+            #模式A，只有RGB
+
+            #模式B，RGB+深度图拼接
+            combined_split = np.hstack((canvas_rgb, depth_view))
+            
+            # 模式 C: 融合图 (将伪彩色深度图透明叠加在 RGB 上)
+            # 0.6 和 0.4 分别是 RGB 和深度的透明度权重，可以自行调整
+            fused_img = cv2.addWeighted(canvas_rgb, 0.6, depth_view, 0.4, 0)
+
+            # --- 4. 多窗口显示 ---
+            # 窗口 1: 识别监控
+            cv2.imshow("1. RGB Recognition", canvas_rgb)
+            
+            # 窗口 2: 拼接对比
+            cv2.imshow("2. Split View (RGB + Depth)", combined_split)
+            
+            # 窗口 3: 融合视图
+            cv2.imshow("3. Fusion View (Overlay)", fused_img)
             
             key = cv2.waitKey(1)
             if key & 0xFF == ord('q'):
