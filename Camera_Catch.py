@@ -5,14 +5,13 @@ import time
 import sys
 from pupil_apriltags import Detector
 
-# ================= 驱动与 DLL 加载 =================
+# ================= 1. 驱动与 DLL 加载 =================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 libs_path = os.path.join(current_dir, 'libs')
 if os.path.exists(libs_path):
     os.add_dll_directory(libs_path) 
 
-from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode, VideoStreamProfile
-
+from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
 
 class Gemini335Camera:
     def __init__(self):
@@ -20,162 +19,169 @@ class Gemini335Camera:
         self.config = Config()
         self.intrinsics = None
 
-        # 初始化 AprilTag 检测器
-        self.at_detector = Detector(families='tag36h11', nthreads=2)
+        # --- 调整检测器参数 ---
+        self.at_detector = Detector(families='tag36h11', nthreads=4, quad_decimate=1.0, decode_sharpening=0.5)
+        self.tag_history = {} # 格式: {id: {'dists': [], 'state': 1}}
 
         try:
-            # 1. 配置彩色流
+            # --- 强制请求 1280x720 高分辨率 ---
             color_profiles = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-            color_profile = color_profiles.get_default_video_stream_profile()
+            try:
+                color_profile = color_profiles.get_video_stream_profile(1280, 720, OBFormat.MJPG, 30)
+            except:
+                color_profile = color_profiles.get_default_video_stream_profile()
             self.config.enable_stream(color_profile)
 
-            # 2. 配置深度流
             depth_profiles = self.pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
             depth_profile = depth_profiles.get_default_video_stream_profile()
             self.config.enable_stream(depth_profile)
 
-            # 3. 开启软件对齐 (必选)
             self.config.set_align_mode(OBAlignMode.SW_MODE)
-
-            # 4. 启动相机
             self.pipeline.start(self.config)
 
-            # 等待硬件参数加载
-            time.sleep(0.5) 
-
-            # 获取出厂标定参数
+            time.sleep(1.0) 
             self.camera_param = self.pipeline.get_camera_param()
-            self.intrinsics = self.camera_param.rgb_intrinsic 
+            # 兼容新旧版 SDK 属性名
+            self.intrinsics = getattr(self.camera_param, 'rgb_intrinsic', getattr(self.camera_param, 'color_intrinsic', None))
 
-            print("Gemini 335 启动成功！已加载出厂内参。")
+            print(f"Gemini 335 启动。当前分辨率: {color_profile.get_width()}x{color_profile.get_height()}")
         except Exception as e:
             print(f"初始化失败: {e}")
             sys.exit(1)
 
-    def get_3d_coordinates(self, u, v, depth_mm):
-        """ 标定转换：像素转3D坐标 """
-        if self.intrinsics is None or depth_mm <= 0:
+    def get_real_3d_pose(self, u, v, depth_z):
+        """ 标定转换：像素+深度 -> 3D坐标(XYZ) + 直线距离(R) """
+        if self.intrinsics is None or depth_z <= 0:
             return None
-
-        # 基于内参的针孔模型公式
-        x_mm = (u - self.intrinsics.cx) * depth_mm / self.intrinsics.fx
-        y_mm = (v - self.intrinsics.cy) * depth_mm / self.intrinsics.fy
-        z_mm = float(depth_mm)
-
-        return (round(x_mm, 2), round(y_mm, 2), round(z_mm, 2))
+        x = (u - self.intrinsics.cx) * depth_z / self.intrinsics.fx
+        y = (v - self.intrinsics.cy) * depth_z / self.intrinsics.fy
+        z = float(depth_z)
+        r = np.sqrt(x**2 + y**2 + z**2)
+        return {'point_3d': (round(x, 2), round(y, 2), round(z, 2)), 'real_dist': round(r, 2)}
 
     def capture_image(self):
+        """ 采集并解码图像 """
         frames = self.pipeline.wait_for_frames(100)
-        if frames is None:
-            return None, None
+        if not frames: return None, None
+        cf = frames.get_color_frame()
+        df = frames.get_depth_frame()
+        if not cf or not df: return None, None
 
-        color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
-
-        if color_frame is None or depth_frame is None:
-            return None, None
-
-        raw_data = color_frame.get_data()
-        fmt = color_frame.get_format()
-
-        if fmt == OBFormat.MJPG:
+        raw_data = cf.get_data()
+        if cf.get_format() == OBFormat.MJPG:
             color_img = cv2.imdecode(np.frombuffer(raw_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-        elif fmt == OBFormat.RGB888:
-            color_img = np.asanyarray(raw_data).reshape((color_frame.get_height(), color_frame.get_width(), 3))
-            color_img = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
         else:
-            try:
-                color_img = np.asanyarray(raw_data).reshape((color_frame.get_height(), color_frame.get_width(), 3))
-            except:
-                return None, None
+            color_img = np.asanyarray(raw_data).reshape((cf.get_height(), cf.get_width(), 3))
+            if cf.get_format() == OBFormat.RGB888:
+                color_img = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
 
-        depth_data = np.asanyarray(depth_frame.get_data()).view(np.uint16).reshape((depth_frame.get_height(), depth_frame.get_width()))
+        depth_data = np.asanyarray(df.get_data()).view(np.uint16).reshape((df.get_height(), df.get_width()))
         return color_img, depth_data
 
-    def detect_apriltags(self, color_img, depth_img, max_dist=2000):
+    def detect_two_level_tags(self, color_img, depth_img, coarse_limit=3500, precise_limit=1000):
+        """ 二级识别逻辑 (包含平滑滤波和滞后缓冲区) """
         gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
-        tags = self.at_detector.detect(gray, estimate_tag_pose=False)
+        tags = self.at_detector.detect(gray)
         
-        valid_tags = []
+        valid_results = []
+        buffer = 50  # 滞后缓冲区 50mm
+
         for tag in tags:
+            tid = tag.tag_id
             ix, iy = int(tag.center[0]), int(tag.center[1])
-            if iy >= depth_img.shape[0] or ix >= depth_img.shape[1]: continue
             
-            dist = depth_img[iy, ix]
+            # --- 多点平均深度采样 ---
+            depth_samples = []
+            corners = tag.corners.astype(int)
+            for (sx, sy) in list(corners) + [(ix, iy)]:
+                if 0 <= sy < depth_img.shape[0] and 0 <= sx < depth_img.shape[1]:
+                    d = depth_img[sy, sx]
+                    if d > 0: depth_samples.append(d)
+            if len(depth_samples) < 3: continue
+            raw_z = sum(depth_samples) / len(depth_samples)
+
+            # --- 时域平滑滤波 (5帧平均) ---
+            if tid not in self.tag_history:
+                self.tag_history[tid] = {'dists': [raw_z], 'state': 1}
+            else:
+                self.tag_history[tid]['dists'].append(raw_z)
+                if len(self.tag_history[tid]['dists']) > 5:
+                    self.tag_history[tid]['dists'].pop(0)
             
-            if 0 < dist <= max_dist:
-                pos_3d = self.get_3d_coordinates(ix, iy, dist)
-                # 仅添加能算出有效 3D 坐标的 Tag
-                if pos_3d is not None:
-                    valid_tags.append({
-                        'id': tag.tag_id,
-                        'center': (ix, iy),
-                        'pos_3d': pos_3d,
-                        'corners': tag.corners.astype(int)
-                    })
-        return valid_tags
+            smooth_z = sum(self.tag_history[tid]['dists']) / len(self.tag_history[tid]['dists'])
+            
+            pose = self.get_real_3d_pose(ix, iy, smooth_z)
+            if not pose: continue
+            
+            r_dist = pose['real_dist']
+            current_state = self.tag_history[tid]['state']
+
+            # --- 滞后判别逻辑 (防闪烁) ---
+            if current_state == 1: # 当前是粗略
+                new_state = 2 if r_dist < (precise_limit - buffer) else 1
+            else: # 当前是精细
+                new_state = 1 if r_dist > (precise_limit + buffer) else 2
+            
+            self.tag_history[tid]['state'] = new_state
+
+            if r_dist <= coarse_limit:
+                valid_results.append({
+                    'id': tid,
+                    'level': new_state,
+                    'xyz': pose['point_3d'],
+                    'r': r_dist,
+                    'center': (ix, iy),
+                    'corners': corners
+                })
+        return valid_results
 
     def show_realtime(self):
-        print("预览模式启动：仅显示标定后的 XYZ 坐标。按 'q' 退出。")
-
+        print("多窗口监控模式启动...")
         while True:
             color, depth = self.capture_image()
             if color is None: continue
 
-            # 识别 (限制 3.5 米)
-            tags = self.detect_apriltags(color, depth, max_dist=2000)
+            tags = self.detect_two_level_tags(color, depth)
 
             canvas_rgb = color.copy()
             for tag in tags:
-                # 画框和中心点
-                cv2.polylines(canvas_rgb, [tag['corners']], True, (0, 255, 0), 2)
-                cv2.circle(canvas_rgb, tag['center'], 5, (0, 0, 255), -1)
-                
-                # --- 核心修改：安全获取并仅显示 XYZ 标定坐标 ---
-                pos = tag.get('pos_3d')
-                if pos is not None:
-                    x, y, z = pos
-                    info_text = f"ID:{tag['id']} XYZ:[{x},{y},{z}]mm"
-                else:
-                    info_text = f"ID:{tag['id']} XYZ:Invalid"
-                
-                cv2.putText(canvas_rgb, info_text, (tag['center'][0]-80, tag['center'][1]-20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                bgr = (0, 255, 0) if tag['level'] == 2 else (0, 255, 255)
+                mode_str = "PRECISE" if tag['level'] == 2 else "COARSE"
 
-            # 深度图伪彩色处理
-            depth_view = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-            depth_view = cv2.applyColorMap(depth_view, cv2.COLORMAP_JET)
+                cv2.polylines(canvas_rgb, [tag['corners']], True, bgr, 2)
+                x, y, z = tag['xyz']
+                info = f"[{mode_str}] ID:{tag['id']} R:{int(tag['r'])}mm"
+                pos_info = f"X:{x} Y:{y} Z:{z}"
+                cv2.putText(canvas_rgb, info, (tag['center'][0]-80, tag['center'][1]-35), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
+                cv2.putText(canvas_rgb, pos_info, (tag['center'][0]-80, tag['center'][1]-15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
 
-            if color.shape[0] != depth_view.shape[0]:
-                depth_view = cv2.resize(depth_view, (color.shape[1], color.shape[0]))
-
-            # 生成显示视图
+            # 深度图伪彩色
+            depth_view = cv2.applyColorMap(cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U), cv2.COLORMAP_JET)
+            if canvas_rgb.shape[0] != depth_view.shape[0]:
+                depth_view = cv2.resize(depth_view, (canvas_rgb.shape[1], canvas_rgb.shape[0]))
+            
             combined_split = np.hstack((canvas_rgb, depth_view))
             fused_img = cv2.addWeighted(canvas_rgb, 0.6, depth_view, 0.4, 0)
 
-            cv2.imshow("1. Recognition (XYZ)", canvas_rgb)
-            cv2.imshow("2. Split View", combined_split)
-            cv2.imshow("3. Fusion View", fused_img)
-            
+            cv2.imshow("1. Recognition (XYZ+R Mode)", canvas_rgb)
+            cv2.imshow("2. Split View (RGB + Depth)", combined_split)
+            cv2.imshow("3. Fusion View (Calibration Check)", fused_img)
+
             key = cv2.waitKey(1)
-            if key & 0xFF == ord('q'):
-                break
+            if key & 0xFF == ord('q'): break
             elif key & 0xFF == ord('s'):
-                timestamp = int(time.time())
-                cv2.imwrite(f"cap_{timestamp}.jpg", color)
+                cv2.imwrite("saved_color.jpg", color)
 
     def stop(self):
-        try:
-            self.pipeline.stop()
-        except:
-            pass
+        try: self.pipeline.stop()
+        except: pass
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     cam = Gemini335Camera()
     try:
         cam.show_realtime()
-    except KeyboardInterrupt:
-        pass
     finally:
         cam.stop()
