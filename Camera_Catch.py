@@ -3,15 +3,25 @@ import numpy as np
 import os
 import time
 import sys
+import platform # 新增：用于判断操作系统
 from pupil_apriltags import Detector
 
-# ================= 1. 驱动与 DLL 加载 =================
+# ================= 1. 驱动与 DLL/SO 加载 (通用适配) =================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 libs_path = os.path.join(current_dir, 'libs')
-if os.path.exists(libs_path):
-    os.add_dll_directory(libs_path) 
 
-from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
+if platform.system() == 'Windows':
+    # Windows 环境：必须手动添加 DLL 目录
+    if os.path.exists(libs_path):
+        os.add_dll_directory(libs_path) 
+else:
+    # Linux 环境：将库路径加入系统搜索路径
+    # 提醒：请确保 libs 目录下放置的是 .so 文件
+    sys.path.append(libs_path)
+    sys.path.append(current_dir)
+
+# 导入相机 SDK
+from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode, VideoStreamProfile
 
 class Gemini335Camera:
     def __init__(self):
@@ -44,7 +54,7 @@ class Gemini335Camera:
             # 兼容新旧版 SDK 属性名
             self.intrinsics = getattr(self.camera_param, 'rgb_intrinsic', getattr(self.camera_param, 'color_intrinsic', None))
 
-            print(f"Gemini 335 启动。当前分辨率: {color_profile.get_width()}x{color_profile.get_height()}")
+            print(f"Gemini 335 启动。当前系统: {platform.system()}, 分辨率: {color_profile.get_width()}x{color_profile.get_height()}")
         except Exception as e:
             print(f"初始化失败: {e}")
             sys.exit(1)
